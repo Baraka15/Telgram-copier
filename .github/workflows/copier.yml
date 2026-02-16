@@ -1,0 +1,60 @@
+name: Telegram Copier
+
+on:
+  schedule:
+    # Every 5 minutes
+    # Only weekdays (Mon–Fri)
+    # Only 02:00 → 20:59 UTC
+    - cron: "*/5 2-20 * * 1-5"
+
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    # ✅ Prevent overlapping executions
+    concurrency:
+      group: telegram-copier
+      cancel-in-progress: true
+
+    # ✅ Hard timeout safety (prevents stuck Telethon jobs)
+    timeout-minutes: 3
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"   # ✅ Speeds up dependency installs
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install telethon
+
+      # ✅ Persistent state cache (REAL FIX)
+      - name: ♻️ Restore state
+        uses: actions/cache@v4
+        with:
+          path: last_seen.json
+          key: lastseen-${{ github.ref }}
+          restore-keys: |
+            lastseen-
+
+      - name: 🚀 Run copier
+        run: python copier.py
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+
+      # ✅ Save updated state
+      - name: 💾 Save state
+        uses: actions/cache@v4
+        with:
+          path: last_seen.json
+          key: lastseen-${{ github.ref }}
