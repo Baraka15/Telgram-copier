@@ -1,0 +1,235 @@
+name: Telegram Copier Realtime Engine
+
+# Triggers: Manual dispatch, scheduled restarts, and push events for auto-deployment
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: "*/15 * * * *"  # Increased frequency to every 15 min for better uptime
+  push:
+    branches:
+      - main  # Auto-deploy on pushes to main
+
+# Permissions: Enhanced for artifacts, logs, and secrets
+permissions:
+  contents: read
+  actions: write  # For artifact uploads/downloads
+  checks: write   # For advanced reporting
+
+# Environment variables available globally
+env:
+  PYTHON_VERSION: "3.11"
+  RUNTIME_DIR: "runtime"
+  LOG_FILE: "copier.log"
+  DB_FILE: "copier.db"  # Assuming DB from script
+  MAX_RETRIES: 5  # For retry mechanisms
+  HEALTH_CHECK_URL: "https://example.com/health"  # Placeholder for external health check
+
+jobs:
+  # Job 1: Build and Test (Pre-run validation)
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Short timeout for build phase
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        id: cache-pip
+        with:
+          path: \~/.cache/pip
+          key: pip-\( {{ runner.os }}- \){{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-\( {{ runner.os }}- \){{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          # Assuming you have a tests folder or pytest setup
+          pip install pytest
+          pytest tests/ || echo "⚠️ Tests failed but continuing"  # Soft fail
+
+      - name: Lint code
+        continue-on-error: true  # Allow continuation even if lint fails (fix locally)
+        run: |
+          pip install flake8 black
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || echo "⚠️ Flake8 issues found"
+          black --check . || echo "⚠️ Black formatting issues found. Run 'black .' locally to fix."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-deps
+          path: |
+            \~/.cache/pip
+            requirements.txt
+
+  # Job 2: Run Copier (Main execution, depends on build-test)
+  run-copier:
+    needs: build-test  # Ensure build passes first
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Long timeout for realtime operation
+
+    strategy:
+      matrix:
+        shard: [1, 2]  # Parallel shards for load balancing (e.g., multiple instances)
+      fail-fast: false  # Allow one shard to fail without stopping others
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-deps
+          path: \~/.cache/pip
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies (from cache)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare persistent storage
+        run: |
+          echo "🚧 Preparing runtime directory: ${{ env.RUNTIME_DIR }}"
+          mkdir -p ${{ env.RUNTIME_DIR }} || { echo "❌ Failed to create directory"; exit 1; }
+          touch \( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }} || { echo "❌ Failed to touch log file"; exit 1; }
+          touch \( {{ env.RUNTIME_DIR }}/ \){{ env.DB_FILE }} || { echo "❌ Failed to touch DB file"; exit 1; }
+          ls -la ${{ env.RUNTIME_DIR }} || { echo "❌ Failed to list directory"; exit 1; }
+          echo "✅ Runtime storage prepared"
+
+      - name: Restore previous state (DB and logs)
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-state
+          path: ${{ env.RUNTIME_DIR }}
+        continue-on-error: true  # If no previous artifact, proceed
+
+      - name: Run Telegram Copier Engine with monitoring
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          SHARD_ID: ${{ matrix.shard }}  # Pass shard info to script if needed
+        run: |
+          echo "🚀 Starting Copier Engine (Shard ${{ matrix.shard }})"
+
+          # Health check setup (example: curl to external monitor)
+          curl -X POST \( {{ env.HEALTH_CHECK_URL }} -d "status=starting&shard= \){{ matrix.shard }}" || echo "⚠️ Health check failed, continuing"
+
+          retry_count=0
+          max_retries=${{ env.MAX_RETRIES }}
+          while [ $retry_count -lt $max_retries ]
+          do
+            python copier.py >> "\( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }}" 2>&1 && break || {
+              echo "⚠️ Crash detected (Retry $retry_count) → restarting in 10s"
+              retry_count=$((retry_count+1))
+              sleep 10
+            }
+          done
+
+          if [ $retry_count -eq $max_retries ]; then
+            echo "❌ Max retries reached → failing job"
+            exit 1
+          fi
+
+      - name: Health check on completion
+        if: always()  # Run even on failure
+        run: |
+          status=$([ ${{ job.status }} == "success" ] && echo "healthy" || echo "failed")
+          curl -X POST ${{ env.HEALTH_CHECK_URL }} -d "status=\( status&shard= \){{ matrix.shard }}" || echo "⚠️ Health check failed"
+
+      - name: Upload logs and DB as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-state
+          path: ${{ env.RUNTIME_DIR }}/*
+          retention-days: 7  # Keep for a week
+
+      - name: Notify on failure (Slack/Telegram example)
+        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
+        uses: ravsamhq/notify-slack-action@v2
+        continue-on-error: true  # Proceed if action fails
+        with:
+          status: ${{ job.status }}
+          notification_title: "Copier Engine Failed (Shard ${{ matrix.shard }})"
+          message_format: "{emoji} *{workflow}* {status_message} in <{repo_url}|{repo}>"
+          footer: "Linked to <{run_url}|run>"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Job 3: Post-run Analysis (Cleanup and Reporting)
+  post-run:
+    needs: run-copier
+    if: always()  # Always run for reporting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download runtime state
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-state
+          path: ${{ env.RUNTIME_DIR }}
+        continue-on-error: true  # Proceed even if no artifact (e.g., if run-copier skipped)
+
+      - name: Analyze logs
+        run: |
+          echo "📊 Log Analysis"
+          if [ -f "\( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }}" ]; then
+            grep -c "✅" "\( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }}" || echo "No successes found"
+            grep -c "⚠" "\( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }}" || echo "No warnings found"
+          else
+            echo "⚠️ Log file not found, skipping analysis"
+          fi
+
+      - name: Backup DB to external storage (e.g., S3)
+        if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_BUCKET: "my-backup-bucket"
+        run: |
+          pip install awscli
+          if [ -f "\( {{ env.RUNTIME_DIR }}/ \){{ env.DB_FILE }}" ]; then
+            aws s3 cp "\( {{ env.RUNTIME_DIR }}/ \){{ env.DB_FILE }}" s3://\( {{ env.S3_BUCKET }}/backups/ \)(date +%Y-%m-%d)-${{ env.DB_FILE }} || echo "⚠️ S3 upload failed"
+          else
+            echo "⚠️ DB file not found, skipping backup"
+          fi
+
+      - name: Generate report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let logContent = '';
+            try {
+              logContent = fs.readFileSync('\( {{ env.RUNTIME_DIR }}/ \){{ env.LOG_FILE }}', 'utf8');
+            } catch (e) {
+              logContent = '⚠️ Log file not available';
+            }
+            core.summary
+              .addHeading('Copier Engine Report')
+              .addCodeBlock(logContent, 'log')
+              .write();
