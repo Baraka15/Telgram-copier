@@ -1,0 +1,52 @@
+name: Ultra Realtime Copier HA
+
+on:
+  workflow_dispatch:   # Manual start
+  schedule:
+    - cron: "*/5 * * * *"   # Watchdog trigger every 5 min
+
+concurrency:
+  group: copier-ha
+  cancel-in-progress: false
+
+jobs:
+  run-copier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # Max allowed before watchdog restarts
+
+    steps:
+      - name: ⬇ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install telethon pyyaml
+
+      - name: ⚙ Create runtime env
+        run: |
+          echo "API_ID=${{ secrets.API_ID }}" >> .env
+          echo "API_HASH=${{ secrets.API_HASH }}" >> .env
+          echo "SESSION_STRING=${{ secrets.SESSION_STRING }}" >> .env
+
+      - name: 🚀 Start HA Engine
+        run: |
+          echo "Starting crash-resilient loop..."
+          while true; do
+            python copier.py || echo "Bot crashed — restarting..."
+            sleep 2
+          done
+
+      - name: 📤 Upload logs (post-run)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: copier-logs
+          path: |
+            *.log
+            *.db
