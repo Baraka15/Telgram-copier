@@ -1,0 +1,122 @@
+name: Telegram Copier – Elite 24/7 Loop
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: telegram-copier
+  cancel-in-progress: false   # NEVER kill running instance
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # < 360 hard GitHub limit
+
+    steps:
+      # =========================
+      # CHECKOUT
+      # =========================
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      # =========================
+      # PYTHON SETUP
+      # =========================
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # =========================
+      # CACHE DEPENDENCIES (speed boost)
+      # =========================
+      - name: ⚡ Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}
+
+      # =========================
+      # INSTALL DEPS
+      # =========================
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install telethon
+
+      # =========================
+      # RESTORE STATE (dedup memory)
+      # =========================
+      - name: ♻️ Restore bot state
+        uses: actions/download-artifact@v4
+        with:
+          name: bot-state
+          path: .
+        continue-on-error: true
+
+      # =========================
+      # VALIDATE SECRETS
+      # =========================
+      - name: 🔐 Validate secrets
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ] || [ -z "$SESSION_STRING" ]; then
+            echo "❌ Missing required secrets"
+            exit 1
+          fi
+          echo "✅ Secrets OK"
+
+      # =========================
+      # RUN BOT
+      # =========================
+      - name: 🚀 Run Elite Copier
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: |
+          echo "⚡ Starting Copier..."
+          python copier.py
+
+      # =========================
+      # SAVE STATE (after exit / timeout)
+      # =========================
+      - name: 💾 Save bot state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state
+          path: |
+            forwarded_hashes.txt
+            copier.log
+        retention-days: 1
+
+      # =========================
+      # CONTROLLED SELF-RESTART
+      # =========================
+      - name: 🔁 Self-restart workflow
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "♻️ Triggering next run..."
+
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_PAT" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow_ref }}/dispatches \
+            -d "{\"ref\":\"main\"}"
+
+      # =========================
+      # FAILSAFE (API failure handling)
+      # =========================
+      - name: ⚠ Restart fallback delay
+        if: failure()
+        run: |
+          echo "⚠ Restart API failed — delaying"
+          sleep 30
