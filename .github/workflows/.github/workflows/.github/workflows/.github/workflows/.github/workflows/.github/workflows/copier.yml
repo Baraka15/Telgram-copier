@@ -1,0 +1,104 @@
+name: Telegram Copier 24/7
+
+on:
+  push:
+    branches: [ main ]
+
+  workflow_dispatch:
+
+  repository_dispatch:
+    types: [ restart_bot ]
+
+concurrency:
+  group: telegram-copier
+  cancel-in-progress: false   # Never kill active runner
+
+jobs:
+  run-copier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # Safety margin (< 360 hard limit)
+
+    steps:
+      # =========================
+      # CHECKOUT
+      # =========================
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      # =========================
+      # PYTHON ENVIRONMENT
+      # =========================
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # =========================
+      # CACHE DEPENDENCIES
+      # =========================
+      - name: ⚡ Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}
+
+      # =========================
+      # INSTALL DEPS
+      # =========================
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install telethon requests
+
+      # =========================
+      # RESTORE STATE
+      # =========================
+      - name: ♻️ Restore bot state
+        uses: actions/download-artifact@v4
+        with:
+          name: bot-state
+          path: .
+        continue-on-error: true
+
+      # =========================
+      # VALIDATE SECRETS
+      # =========================
+      - name: 🔐 Validate secrets
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ] || [ -z "$SESSION_STRING" ]; then
+            echo "❌ Missing secrets"
+            exit 1
+          fi
+          echo "✅ Secrets OK"
+
+      # =========================
+      # RUN BOT
+      # =========================
+      - name: 🚀 Run Copier
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "⚡ Starting Elite Copier"
+          python copier.py
+
+      # =========================
+      # SAVE STATE ALWAYS
+      # =========================
+      - name: 💾 Save bot state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-state
+          path: |
+            forwarded_hashes.txt
+            copier.log
+          retention-days: 1
